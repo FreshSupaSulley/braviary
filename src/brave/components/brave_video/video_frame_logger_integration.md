@@ -1,127 +1,103 @@
 # VideoFrameLogger Integration Guide
 
-## Overview
+## Hook Point: VideoFrameCompositor
 
-This document describes how to integrate the `VideoFrameLogger` with Chromium's `VideoRenderer` to capture and log video frame metadata.
+The observer attaches at `VideoFrameCompositor` — the single point where every
+displayed frame passes from the media pipeline to the compositor.
 
-## Integration Steps
+File: `src/media/renderers/video_frame_compositor.h`
 
-### Step 1: Create VideoFrameLogger Instance
+## Chromium-side patch (minimal)
 
-In the renderer initialization code where `VideoRenderer` is created, instantiate the logger:
+### video_frame_compositor.h
 
 ```cpp
-// File: src/content/renderer/media/render_media_client.cc (or similar initialization)
+#include "media/base/video_frame_observer.h"
+#include "base/memory/raw_ptr.h"
 
+class MEDIA_EXPORT VideoFrameCompositor : ... {
+ public:
+  // Add:
+  void SetFrameObserver(VideoFrameObserver* observer);
+
+ private:
+  // Add:
+  raw_ptr<VideoFrameObserver> frame_observer_ = nullptr;
+};
+```
+
+### video_frame_compositor.cc
+
+In `UpdateCurrentFrame()`, after `current_frame_` is set:
+
+```cpp
+void VideoFrameCompositor::SetFrameObserver(VideoFrameObserver* observer) {
+  frame_observer_ = observer;
+}
+
+// Inside UpdateCurrentFrame(), at the end:
+if (frame_observer_ && current_frame_) {
+  frame_observer_->OnFrame(current_frame_);
+}
+```
+
+## Brave-side wiring
+
+### chromium_src override (preferred)
+
+Create: `src/brave/chromium_src/third_party/blink/renderer/platform/media/web_media_player_impl.cc`
+
+Use Brave's preprocessor-based override pattern to inject the observer
+during `WebMediaPlayerImpl` construction:
+
+```cpp
 #include "brave/components/brave_video/video_frame_logger.h"
-#include "media/renderers/video_renderer.h"
 
-// During initialization:
-auto video_logger = base::MakeRefCounted<brave::VideoFrameLogger>();
+// Override CreateVideoFrameCompositor or post-construction hook:
+// After compositor_ is created:
+static brave::VideoFrameLogger g_frame_logger;
+compositor_->SetFrameObserver(&g_frame_logger);
 ```
 
-### Step 2: Attach Observer to VideoRenderer
+For a proper implementation, the logger lifetime should be tied to
+the `WebMediaPlayerImpl` instance (use a member unique_ptr).
 
-After creating the `VideoRenderer`, attach the observer:
+### Alternative: direct patch to WebMediaPlayerImpl
 
-```cpp
-// Create VideoRenderer
-auto video_renderer = std::make_unique<media::VideoRenderer>(
-    media_task_runner,
-    video_decoder_selector,
-    ...);
+If `chromium_src` override is too complex for the compositor wiring:
 
-// Attach frame observer (logging)
-video_renderer->SetFrameObserver(video_logger);
-
-// Continue with pipeline setup...
+```diff
+--- a/third_party/blink/renderer/platform/media/web_media_player_impl.cc
++++ b/third_party/blink/renderer/platform/media/web_media_player_impl.cc
+@@ -XXX,6 +XXX,10 @@
++#include "brave/components/brave_video/video_frame_logger.h"
++
+ WebMediaPlayerImpl::WebMediaPlayerImpl(...) {
+   ...
+   compositor_ = ...;
++  frame_logger_ = std::make_unique<brave::VideoFrameLogger>();
++  compositor_->SetFrameObserver(frame_logger_.get());
+   ...
+ }
 ```
 
-### Step 3: Verify Output
+## Build
 
-When YouTube video is played with frame logging enabled:
+Add dep to `//brave/browser:browser` or the appropriate top-level target:
 
-```
-Frame #1 | Size: 1920x1080 | Timestamp: 00:00:00.000000 | Format: YV12
-Frame #2 | Size: 1920x1080 | Timestamp: 00:00:00.033333 | Format: YV12
-Frame #3 | Size: 1920x1080 | Timestamp: 00:00:00.066667 | Format: YV12
-...
+```gn
+deps += [ "//brave/components/brave_video" ]
 ```
 
-## Architecture
-
-```
-VideoRenderer::OnFrameReady(frame)
-    ↓
-VideoFrameObserver::OnFrame(frame)  ← Called here
-    ↓
-VideoFrameLogger::OnFrame(frame)    ← Logs metadata
-    ↓
-VLOG(1) << "Frame #N | Size: ... | Timestamp: ... | Format: ..."
-```
-
-## Key Points
-
-- **No pixel copying**: The `scoped_refptr<VideoFrame>` provides only reference-counted access to metadata
-- **Low overhead**: VLOG(1) calls only occur when `--v=1` or higher is specified
-- **Multiple observers**: Can attach multiple observers if needed (extend the implementation to support multiple subscribers)
-- **Automatic cleanup**: RefCounting ensures proper lifetime management
-
-## Frame Metadata Available
-
-The `VideoFrame` object passed to the observer provides:
-
-- `timestamp()` → Presentation timestamp (base::TimeDelta)
-- `coded_size()` → Full encoded dimensions (gfx::Size, e.g., 1920x1080)
-- `visible_rect()` → Visible portion (gfx::Rect)
-- `format()` → Pixel format enum (YV12, NV12, I420, etc.)
-- `color_space()` → Color space information (gfx::ColorSpace)
-- `data(plane)` → Raw pixel data pointer (NOT used in this logger to avoid copies)
-
-## Build Process
+## Test
 
 ```bash
-# Sync and initialize
-npm run sync -- --init
-
-# Generate build configuration
-npm run gn -- gen out/Default
-
-# Build
-npm run build
-
-# Test with logging
-./out/Default/brave --enable-logging --v=1
+npm run build -- Debug
+npm start -- Debug --args --enable-logging=stderr --v=1 --vmodule="video_frame_logger*=1"
 ```
 
-## Expected Build Output
-
-When building with these patches, you should see:
-
+Play YouTube → terminal shows:
 ```
-[1234/5678] CXX obj/media/renderers/video_renderer.o
-[1235/5678] SOLINK obj/libmedia.so
+Frame #1 | 1920x1080 | visible=0,0 1920x1080 | ts=0:00:00 | fmt=I420
+Frame #2 | 1920x1080 | visible=0,0 1920x1080 | ts=0:00:00.033 | fmt=I420
 ```
-
-No errors should occur since the changes are backward compatible (observer is optional).
-
-## Troubleshooting
-
-### No logs appearing?
-
-1. Verify `--enable-logging --v=1` flags are set
-2. Check that YouTube video is actually playing
-3. Ensure frame_observer is being set (add a DCHECK in VideoRenderer::SetFrameObserver)
-
-### Build errors?
-
-1. Ensure `#include "media/base/video_frame_observer.h"` is at the top of files
-2. Verify `brave/components/brave_video/BUILD.gn` has correct deps
-3. Check that VideoFrame enum methods match your Chromium version
-
-## Future Enhancements
-
-- Support multiple observers (use callback list instead of single pointer)
-- Add frame filtering (log only certain formats or sizes)
-- Implement frame capture (save YUV frames to disk)
-- Add performance profiling (frame processing latency)

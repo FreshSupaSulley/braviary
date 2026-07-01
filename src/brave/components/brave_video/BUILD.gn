@@ -6,8 +6,6 @@ static_library("brave_video") {
 
   deps = [
     "//base",
-    "//media",
+    "//media/base",
   ]
-
-  configs += [ "//build/config/compiler:wexit_time_destructors" ]
 }
